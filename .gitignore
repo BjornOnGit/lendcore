@@ -1,0 +1,17 @@
+# Go
+bin/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
