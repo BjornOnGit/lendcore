@@ -1,0 +1,33 @@
+# Local development stack. Credentials here are for local use only.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      # Loopback only (the dev password is weak). If 5432 is taken on your
+      # machine, put POSTGRES_PORT=5433 (or any free port) in a git-ignored .env.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, on first start with an empty volume (see `make reset-db`).
+      # "z" relabels the file for SELinux (Fedora/RHEL) so the container may read
+      # it; it is a no-op on systems without SELinux.
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro,z
+    healthcheck:
+      # -h 127.0.0.1 matters: during first-time init the image runs a temporary
+      # server that only listens on the unix socket, so a TCP check turns
+      # healthy only after init.sql has finished and the real server is up.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      # First-time init (initdb, init.sql, shutdown checkpoint) can take a
+      # minute or more on slow disks. Probes that fail inside this window do not
+      # count as unhealthy, and the first success ends it, so normal restarts
+      # still turn healthy within seconds.
+      start_period: 120s
+
+volumes:
+  pgdata:
