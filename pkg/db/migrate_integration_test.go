@@ -4,46 +4,18 @@ package db
 
 import (
 	"context"
-	"net/url"
-	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/BjornOnGit/lendcore/pkg/testutil"
 )
 
-// tempDatabase creates an empty, uniquely named database on the server that
-// adminDSN (a postgres:// URL) points at, and returns a DSN for it. The
-// database is dropped when the test ends, so migrations never touch shared data.
-func tempDatabase(t *testing.T, adminDSN string) string {
-	t.Helper()
-	u, err := url.Parse(adminDSN)
-	require.NoError(t, err, "TEST_DATABASE_URL must be a postgres:// URL")
-
-	ctx := context.Background()
-	admin, err := Connect(ctx, adminDSN)
-	require.NoError(t, err)
-	t.Cleanup(admin.Close)
-
-	name := "lendcore_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	ident := pgx.Identifier{name}.Sanitize()
-	_, err = admin.Exec(ctx, "CREATE DATABASE "+ident)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_, err := admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+ident+" WITH (FORCE)")
-		assert.NoError(t, err)
-	})
-
-	u.Path = "/" + name
-	return u.String()
-}
-
 func TestMigrateIntegration(t *testing.T) {
-	dsn := tempDatabase(t, testDSN(t))
+	dsn := testutil.NewDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
