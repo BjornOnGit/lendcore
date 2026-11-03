@@ -8,9 +8,9 @@ test: ## Run unit tests (no external services)
 	@echo "==> go test -race ./..."
 	@go test -race ./...
 
-test-integration: ## Run unit + integration tests (needs Postgres)
+test-integration: ## Run unit + integration tests (uses TEST_DATABASE_URL, else the compose Postgres from make up-db)
 	@echo "==> go test -race -tags=integration ./..."
-	@go test -race -tags=integration ./...
+	@TEST_DATABASE_URL="$${TEST_DATABASE_URL:-$$(docker compose port postgres 5432 2>/dev/null | sed 's|^|postgres://postgres:postgres@|; s|$$|/postgres?sslmode=disable|')}" go test -race -tags=integration ./...
 
 lint: ## Run golangci-lint
 	@echo "==> golangci-lint run ./..."
