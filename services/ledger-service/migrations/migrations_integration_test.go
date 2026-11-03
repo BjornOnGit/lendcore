@@ -64,6 +64,17 @@ func publicTables(t *testing.T, conn *pgx.Conn) []string {
 	return tables
 }
 
+func publicFunctions(t *testing.T, conn *pgx.Conn) []string {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), `
+		SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname = 'public' ORDER BY 1`)
+	require.NoError(t, err)
+	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	require.NoError(t, err)
+	return names
+}
+
 // migratedDB returns a fresh database with all ledger migrations applied.
 func migratedDB(t *testing.T) *pgx.Conn {
 	t.Helper()
@@ -109,12 +120,15 @@ func TestMigrationsUpDownUp(t *testing.T) {
 
 	require.NoError(t, db.Migrate(ctx, dsn, migrations.FS, "."), "up")
 	assert.ElementsMatch(t, wantTables, publicTables(t, conn))
+	assert.Equal(t, []string{"check_entries_balanced"}, publicFunctions(t, conn))
 
 	migrateDown(t, dsn)
 	assert.Equal(t, []string{"schema_migrations"}, publicTables(t, conn), "down must remove every table it created")
+	assert.Empty(t, publicFunctions(t, conn), "down must remove every function it created")
 
 	require.NoError(t, db.Migrate(ctx, dsn, migrations.FS, "."), "up again")
 	assert.ElementsMatch(t, wantTables, publicTables(t, conn))
+	assert.Equal(t, []string{"check_entries_balanced"}, publicFunctions(t, conn))
 }
 
 func TestAccountsColumns(t *testing.T) {
@@ -316,28 +330,220 @@ func TestEntriesBehavior(t *testing.T) {
 		assert.Equal(t, "entries_account_id_fkey", pgErr.ConstraintName)
 	})
 
-	t.Run("a balanced pair is accepted", func(t *testing.T) {
-		pairTxn, creditAccount := uuid.NewString(), uuid.NewString()
-		require.NoError(t, insertTransaction(ctx, conn, pairTxn, uuid.NewString(), nil))
-		require.NoError(t, insertAccount(ctx, conn, creditAccount))
+	t.Run("indexes exist", func(t *testing.T) {
+		wantIndexes := map[string]string{
+			"entries_account_idx":     "(account_id, id)",
+			"entries_transaction_idx": "(transaction_id)",
+		}
+		for index, want := range wantIndexes {
+			var def string
+			require.NoError(t, conn.QueryRow(ctx,
+				"SELECT indexdef FROM pg_indexes WHERE tablename = 'entries' AND indexname = $1", index).Scan(&def), index)
+			assert.Contains(t, def, want, index)
+		}
+	})
+}
 
-		// Inserted in one database transaction, so this keeps passing once a
-		// balanced-transaction trigger checks debits against credits at commit.
+func seedTransaction(t *testing.T, conn *pgx.Conn) string {
+	t.Helper()
+	id := uuid.NewString()
+	require.NoError(t, insertTransaction(context.Background(), conn, id, uuid.NewString(), nil))
+	return id
+}
+
+func seedAccount(t *testing.T, conn *pgx.Conn) string {
+	t.Helper()
+	id := uuid.NewString()
+	require.NoError(t, insertAccount(context.Background(), conn, id))
+	return id
+}
+
+func entryCount(t *testing.T, conn *pgx.Conn, txnID string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, conn.QueryRow(context.Background(),
+		"SELECT count(*) FROM entries WHERE transaction_id = $1::uuid", txnID).Scan(&n))
+	return n
+}
+
+// seedBalancedPair commits one debit and one credit of amount for a new
+// transaction and returns the transaction id and the two entry ids.
+func seedBalancedPair(t *testing.T, conn *pgx.Conn, amount int64) (txnID string, debitID, creditID int64) {
+	t.Helper()
+	ctx := context.Background()
+	txnID = seedTransaction(t, conn)
+	debitAccount, creditAccount := seedAccount(t, conn), seedAccount(t, conn)
+
+	tx, err := conn.Begin(ctx)
+	require.NoError(t, err)
+	insert := func(account, direction string) (id int64) {
+		require.NoError(t, tx.QueryRow(ctx,
+			"INSERT INTO entries (transaction_id, account_id, direction, amount) VALUES ($1::uuid, $2::uuid, $3, $4) RETURNING id",
+			txnID, account, direction, amount).Scan(&id))
+		return id
+	}
+	debitID, creditID = insert(debitAccount, "DEBIT"), insert(creditAccount, "CREDIT")
+	require.NoError(t, tx.Commit(ctx))
+	return txnID, debitID, creditID
+}
+
+type entrySpec struct {
+	direction string
+	amount    int64
+}
+
+func TestEntriesBalanceTrigger(t *testing.T) {
+	conn := migratedDB(t)
+	ctx := context.Background()
+
+	// post inserts the entries for a new transaction inside one database
+	// transaction and returns the transaction id and the error from COMMIT.
+	// The inserts themselves must succeed: balance is only checked at commit.
+	post := func(t *testing.T, specs ...entrySpec) (string, error) {
+		t.Helper()
+		accounts := make([]string, len(specs))
+		for i := range specs {
+			accounts[i] = seedAccount(t, conn)
+		}
+		txnID := seedTransaction(t, conn)
+
 		tx, err := conn.Begin(ctx)
 		require.NoError(t, err)
-		require.NoError(t, insertEntry(ctx, tx, pairTxn, accountID, "DEBIT", 100))
-		require.NoError(t, insertEntry(ctx, tx, pairTxn, creditAccount, "CREDIT", 100))
-		require.NoError(t, tx.Commit(ctx))
+		for i, s := range specs {
+			require.NoError(t, insertEntry(ctx, tx, txnID, accounts[i], s.direction, s.amount),
+				"the insert must succeed; balance is only checked at commit")
+		}
+		return txnID, tx.Commit(ctx)
+	}
 
-		var n int
-		require.NoError(t, conn.QueryRow(ctx, "SELECT count(*) FROM entries WHERE transaction_id = $1::uuid", pairTxn).Scan(&n))
-		assert.Equal(t, 2, n)
+	assertUnbalanced := func(t *testing.T, err error) {
+		t.Helper()
+		pgErr := pgErrorOf(t, err)
+		assert.Equal(t, codeCheck, pgErr.Code)
+		assert.Equal(t, "entries_balanced", pgErr.ConstraintName)
+		assert.Contains(t, pgErr.Message, "unbalanced")
+	}
+
+	t.Run("balanced entries commit", func(t *testing.T) {
+		txnID, err := post(t, entrySpec{"DEBIT", 100}, entrySpec{"CREDIT", 100})
+
+		require.NoError(t, err)
+		assert.Equal(t, 2, entryCount(t, conn, txnID))
 	})
 
-	t.Run("account index covers (account_id, id)", func(t *testing.T) {
-		var def string
-		require.NoError(t, conn.QueryRow(ctx,
-			"SELECT indexdef FROM pg_indexes WHERE tablename = 'entries' AND indexname = 'entries_account_idx'").Scan(&def))
-		assert.Contains(t, def, "(account_id, id)")
+	t.Run("one debit split across two credits commits", func(t *testing.T) {
+		txnID, err := post(t, entrySpec{"DEBIT", 100}, entrySpec{"CREDIT", 60}, entrySpec{"CREDIT", 40})
+
+		require.NoError(t, err)
+		assert.Equal(t, 3, entryCount(t, conn, txnID))
+	})
+
+	t.Run("unbalanced entries fail at commit and leave nothing behind", func(t *testing.T) {
+		txnID, err := post(t, entrySpec{"DEBIT", 100}, entrySpec{"CREDIT", 90})
+
+		assertUnbalanced(t, err)
+		assert.Contains(t, pgErrorOf(t, err).Message, "debits 100 <> credits 90")
+		assert.Zero(t, entryCount(t, conn, txnID), "the failed commit must roll the entries back")
+	})
+
+	t.Run("credits exceeding debits fail at commit", func(t *testing.T) {
+		txnID, err := post(t, entrySpec{"DEBIT", 100}, entrySpec{"CREDIT", 110})
+
+		assertUnbalanced(t, err)
+		assert.Contains(t, pgErrorOf(t, err).Message, "debits 100 <> credits 110")
+		assert.Zero(t, entryCount(t, conn, txnID))
+	})
+
+	t.Run("a lone entry fails at commit", func(t *testing.T) {
+		txnID, err := post(t, entrySpec{"DEBIT", 100})
+
+		assertUnbalanced(t, err)
+		assert.Zero(t, entryCount(t, conn, txnID))
+	})
+
+	t.Run("changing an amount so it no longer balances fails", func(t *testing.T) {
+		txnID, debitID, _ := seedBalancedPair(t, conn, 100)
+
+		_, err := conn.Exec(ctx, "UPDATE entries SET amount = amount + 1 WHERE id = $1", debitID)
+
+		assertUnbalanced(t, err)
+		var amount int64
+		require.NoError(t, conn.QueryRow(ctx, "SELECT amount FROM entries WHERE id = $1", debitID).Scan(&amount))
+		assert.EqualValues(t, 100, amount, "the failed update must not stick")
+		assert.Equal(t, 2, entryCount(t, conn, txnID))
+	})
+
+	t.Run("changing both sides together stays balanced", func(t *testing.T) {
+		txnID, debitID, creditID := seedBalancedPair(t, conn, 100)
+
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+		_, err = tx.Exec(ctx, "UPDATE entries SET amount = 150 WHERE id IN ($1, $2)", debitID, creditID)
+		require.NoError(t, err)
+
+		require.NoError(t, tx.Commit(ctx))
+		assert.Equal(t, 2, entryCount(t, conn, txnID))
+	})
+
+	t.Run("an entry moved out of a transaction unbalances it even if the destination stays balanced", func(t *testing.T) {
+		txnA, debitA, _ := seedBalancedPair(t, conn, 100)
+		txnB, _, _ := seedBalancedPair(t, conn, 50)
+		offsetAccount := seedAccount(t, conn)
+
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+		_, err = tx.Exec(ctx, "UPDATE entries SET transaction_id = $1::uuid WHERE id = $2", txnB, debitA)
+		require.NoError(t, err)
+		// B now has debits 150 against credits 50; an extra credit of 100 rebalances it,
+		// so only A, the transaction the entry left, is wrong at commit.
+		require.NoError(t, insertEntry(ctx, tx, txnB, offsetAccount, "CREDIT", 100))
+
+		err = tx.Commit(ctx)
+
+		assertUnbalanced(t, err)
+		assert.Contains(t, pgErrorOf(t, err).Message, txnA, "the error must name the transaction that became unbalanced")
+		assert.Equal(t, 2, entryCount(t, conn, txnA))
+		assert.Equal(t, 2, entryCount(t, conn, txnB))
+	})
+
+	t.Run("an entry moved into a transaction unbalances it even if the source stays balanced", func(t *testing.T) {
+		txnA, debitA, _ := seedBalancedPair(t, conn, 100)
+		txnB, _, _ := seedBalancedPair(t, conn, 50)
+		offsetAccount := seedAccount(t, conn)
+
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+		_, err = tx.Exec(ctx, "UPDATE entries SET transaction_id = $1::uuid WHERE id = $2", txnB, debitA)
+		require.NoError(t, err)
+		// A is left with only its credit of 100; an extra debit of 100 rebalances it,
+		// so only B, the transaction the entry joined, is wrong at commit.
+		require.NoError(t, insertEntry(ctx, tx, txnA, offsetAccount, "DEBIT", 100))
+
+		err = tx.Commit(ctx)
+
+		assertUnbalanced(t, err)
+		assert.Contains(t, pgErrorOf(t, err).Message, txnB, "the error must name the transaction that became unbalanced")
+		assert.Equal(t, 2, entryCount(t, conn, txnA))
+		assert.Equal(t, 2, entryCount(t, conn, txnB))
+	})
+
+	t.Run("deleting one entry fails", func(t *testing.T) {
+		txnID, _, creditID := seedBalancedPair(t, conn, 100)
+
+		_, err := conn.Exec(ctx, "DELETE FROM entries WHERE id = $1", creditID)
+
+		assertUnbalanced(t, err)
+		assert.Equal(t, 2, entryCount(t, conn, txnID), "the failed delete must not stick")
+	})
+
+	t.Run("moving an entry to another transaction fails", func(t *testing.T) {
+		txnA, debitA, _ := seedBalancedPair(t, conn, 100)
+		txnB, _, _ := seedBalancedPair(t, conn, 50)
+
+		_, err := conn.Exec(ctx, "UPDATE entries SET transaction_id = $1::uuid WHERE id = $2", txnB, debitA)
+
+		assertUnbalanced(t, err)
+		assert.Equal(t, 2, entryCount(t, conn, txnA))
+		assert.Equal(t, 2, entryCount(t, conn, txnB))
 	})
 }
