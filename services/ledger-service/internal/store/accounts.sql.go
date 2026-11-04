@@ -46,6 +46,45 @@ func (q *Queries) CreateAccount(ctx context.Context, arg CreateAccountParams) (A
 	return i, err
 }
 
+const createAccountIfAbsent = `-- name: CreateAccountIfAbsent :one
+INSERT INTO accounts (id, owner_id, type, currency, allow_negative)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (owner_id, type) WHERE owner_id IS NOT NULL DO NOTHING
+RETURNING id, owner_id, type, currency, balance, allow_negative, created_at
+`
+
+type CreateAccountIfAbsentParams struct {
+	ID            uuid.UUID
+	OwnerID       *uuid.UUID
+	Type          string
+	Currency      string
+	AllowNegative bool
+}
+
+// Inserts the account unless one already exists for this owner and type. On a
+// conflict nothing changes and no row is returned (pgx.ErrNoRows). Accounts
+// without an owner never conflict.
+func (q *Queries) CreateAccountIfAbsent(ctx context.Context, arg CreateAccountIfAbsentParams) (Account, error) {
+	row := q.db.QueryRow(ctx, createAccountIfAbsent,
+		arg.ID,
+		arg.OwnerID,
+		arg.Type,
+		arg.Currency,
+		arg.AllowNegative,
+	)
+	var i Account
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Type,
+		&i.Currency,
+		&i.Balance,
+		&i.AllowNegative,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getAccount = `-- name: GetAccount :one
 SELECT id, owner_id, type, currency, balance, allow_negative, created_at FROM accounts WHERE id = $1
 `

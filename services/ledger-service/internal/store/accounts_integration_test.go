@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -17,8 +18,8 @@ import (
 	"github.com/BjornOnGit/lendcore/services/ledger-service/migrations"
 )
 
-// migratedQueries returns Queries on a fresh database with the ledger migrations applied.
-func migratedQueries(t *testing.T) *Queries {
+// migratedPool returns a pool on a fresh database with the ledger migrations applied.
+func migratedPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := testutil.NewDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -27,7 +28,13 @@ func migratedQueries(t *testing.T) *Queries {
 	pool, err := db.Connect(ctx, dsn)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
-	return New(pool)
+	return pool
+}
+
+// migratedQueries returns Queries on a fresh database with the ledger migrations applied.
+func migratedQueries(t *testing.T) *Queries {
+	t.Helper()
+	return New(migratedPool(t))
 }
 
 func TestAccountQueries(t *testing.T) {
